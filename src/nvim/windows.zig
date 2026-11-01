@@ -72,6 +72,7 @@ pub fn askChannel(nvim: *Nvim) !u32 {
 
 /// What the Lua tells the daemon.
 pub const Note = union(enum) {
+    focus: Direction,
     /// The current window is now this one.
     current: i64,
     /// This window is closing and reopening; keep its pane for the new one.
@@ -81,6 +82,8 @@ pub const Note = union(enum) {
     /// The current window is now this float.
     float: i64,
 };
+
+pub const Direction = enum { left, down, up, right };
 
 /// Where a new window sits in Neovim's layout.
 pub const Split = struct {
@@ -95,6 +98,10 @@ pub const Split = struct {
 
 /// A notification from the Lua, or null for any other.
 pub fn parseNote(method: []const u8, params: *msgpack.Decoder) !?Note {
+    if (std.mem.eql(u8, method, "neorex_focus")) {
+        if (try rpc.expectArray(params) != 1) return error.BadMessage;
+        return .{ .focus = std.meta.stringToEnum(Direction, try rpc.expectStr(params)) orelse return error.BadMessage };
+    }
     const tag: std.meta.Tag(Note) = if (std.mem.eql(u8, method, "neorex_win"))
         .current
     else if (std.mem.eql(u8, method, "neorex_reopen"))
@@ -108,6 +115,7 @@ pub fn parseNote(method: []const u8, params: *msgpack.Decoder) !?Note {
     if (try rpc.expectArray(params) < if (tag == .split) @as(u32, 4) else 1) return error.BadMessage;
     const win = try rpc.expectHandle(params);
     return switch (tag) {
+        .focus => unreachable,
         .current => .{ .current = win },
         .reopen => .{ .reopen = win },
         .float => .{ .float = win },
@@ -120,6 +128,55 @@ pub fn parseNote(method: []const u8, params: *msgpack.Decoder) !?Note {
     };
 }
 
+test "control arrows request pane focus in Normal mode and move the cursor in Insert mode" {
+    var buf: [1024]u8 = undefined;
+    var h: Harness = .{ .nvim = try Nvim.spawn(testing.io, &.{ "nvim", "--clean", "--embed", "-n" }, &buf) };
+    defer h.deinit();
+    try h.nvim.uiAttach(40, 10, .{ .ext_multigrid = true });
+    h.chan_id = try askChannel(&h.nvim);
+    try h.nvim.flush();
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.wins[0] != 0 and x.kind(x.wins[0]) == .external;
+        }
+    }.f));
+    h.notes.clearRetainingCapacity();
+    try h.input("<C-Right>");
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            for (x.notes.items) |n| if (n == .focus and n.focus == .right) return true;
+            return false;
+        }
+    }.f));
+    try h.check("vim.api.nvim_buf_set_lines(0, 0, -1, false, {'one', 'two'}); vim.api.nvim_win_set_cursor(0, {2, 0})");
+    h.notes.clearRetainingCapacity();
+    try h.input("i<C-Up>");
+    try h.check("assert(vim.api.nvim_win_get_cursor(0)[1] == 1, 'Insert mode must keep its arrow')");
+    for (h.notes.items) |n| try testing.expect(n != .focus);
+}
+
+test "plugins distinguish external editor panes from floating windows" {
+    var buf: [1024]u8 = undefined;
+    var h: Harness = .{ .nvim = try Nvim.spawn(testing.io, &.{ "nvim", "--clean", "--embed", "-n" }, &buf) };
+    defer h.deinit();
+    try h.nvim.uiAttach(40, 10, .{ .ext_multigrid = true });
+    h.chan_id = try askChannel(&h.nvim);
+    try h.nvim.flush();
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.wins[0] != 0 and x.kind(x.wins[0]) == .external;
+        }
+    }.f));
+    try h.check(
+        \\assert(vim.fn.win_gettype() == '', 'external editor must allow ToggleTerm splits')
+        \\assert(vim.fn.win_gettype(0) == '')
+        \\assert(vim.fn.win_gettype(vim.api.nvim_get_current_win()) == '')
+        \\local float = vim.api.nvim_open_win(0, false, {relative='editor',row=0,col=0,width=10,height=2})
+        \\assert(vim.fn.win_gettype(float) == 'popup', 'real floats must remain floats')
+        \\vim.api.nvim_win_close(float, true)
+    );
+}
+
 /// `[first, anchor]` from `setup`'s response.
 pub fn parseSetup(result: *msgpack.Decoder) ![2]i64 {
     if (try rpc.expectArray(result) < 2) return error.BadMessage;
@@ -130,6 +187,21 @@ pub fn parseSetup(result: *msgpack.Decoder) ![2]i64 {
 pub fn parseChannel(result: *msgpack.Decoder) !i64 {
     if (try rpc.expectArray(result) < 1) return error.BadMessage;
     return rpc.expectInt(result);
+}
+
+/// An authoritative snapshot includes inactive tabs, whose grids can disappear.
+pub fn parseLayout(params: *msgpack.Decoder, gpa: std.mem.Allocator, owners: *std.AutoArrayHashMapUnmanaged(i64, i64)) !i64 {
+    if (try rpc.expectArray(params) != 2) return error.BadMessage;
+    const tab = try rpc.expectHandle(params);
+    const count = try rpc.expectArray(params);
+    owners.clearRetainingCapacity();
+    for (0..count) |_| {
+        if (try rpc.expectArray(params) != 2) return error.BadMessage;
+        const win = try rpc.expectHandle(params);
+        const owner = try rpc.expectHandle(params);
+        try owners.put(gpa, win, owner);
+    }
+    return tab;
 }
 
 const testing = std.testing;
@@ -147,10 +219,14 @@ const Harness = struct {
     /// The windows a check waits for.
     want: i64 = 0,
     gone: i64 = 0,
+    owners: std.AutoArrayHashMapUnmanaged(i64, i64) = .empty,
+    check_id: u32 = 0,
+    checked: bool = false,
 
     fn deinit(h: *Harness) void {
         h.grids.deinit(testing.allocator);
         h.notes.deinit(testing.allocator);
+        h.owners.deinit(testing.allocator);
         h.nvim.deinit(testing.allocator);
     }
 
@@ -167,6 +243,8 @@ const Harness = struct {
                     var params = n.params;
                     if (std.mem.eql(u8, n.method, "redraw")) {
                         _ = try h.grids.applyRedraw(gpa, &params);
+                    } else if (std.mem.eql(u8, n.method, "neorex_layout")) {
+                        _ = try parseLayout(&params, gpa, &h.owners);
                     } else if (try parseNote(n.method, &params)) |note| try h.notes.append(gpa, note);
                 },
                 .response => |r| {
@@ -175,6 +253,7 @@ const Harness = struct {
                         return error.NvimError;
                     }
                     var result = r.result;
+                    if (r.id == h.check_id) h.checked = true;
                     if (r.id == h.chan_id) {
                         h.setup_id = try setup(&h.nvim, try parseChannel(&result), 40, 9);
                         try h.nvim.flush();
@@ -190,6 +269,17 @@ const Harness = struct {
         _ = try h.nvim.request("nvim_input", 1);
         try msgpack.writeStr(h.nvim.writer(), keys);
         try h.nvim.flush();
+    }
+
+    fn check(h: *Harness, code: []const u8) !void {
+        h.checked = false;
+        h.check_id = try h.nvim.execLua(code, 0);
+        try h.nvim.flush();
+        try testing.expect(try h.until(struct {
+            fn f(x: *Harness) bool {
+                return x.checked;
+            }
+        }.f));
     }
 
     fn lastCurrent(h: *const Harness) i64 {
@@ -382,4 +472,30 @@ test "each window shows a statusline inside its pane" {
             return gridHeight(x, x.wins[0]) == 9 and rowStarts(x, x.wins[0], 8, "MINE");
         }
     }.f));
+}
+
+test "plugins can query the previous tab's current window after tabnew" {
+    var buf: [1024]u8 = undefined;
+    var h: Harness = .{ .nvim = try Nvim.spawn(testing.io, &.{ "nvim", "--clean", "--embed", "-n" }, &buf) };
+    defer h.deinit();
+    try h.nvim.uiAttach(40, 10, .{ .ext_multigrid = true });
+    h.chan_id = try askChannel(&h.nvim);
+    try h.nvim.flush();
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.wins[0] != 0 and x.kind(x.wins[0]) == .external;
+        }
+    }.f));
+    h.notes.clearRetainingCapacity();
+    try h.input(":lua vim.api.nvim_create_autocmd('TabNew', {callback=function() vim.api.nvim_tabpage_get_win(vim.api.nvim_list_tabpages()[vim.fn.tabpagenr('#')]) end})<CR>:tabnew<CR>");
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.lastCurrent() != 0 and x.lastCurrent() != x.wins[0];
+        }
+    }.f));
+    try h.check("assert(vim.api.nvim_win_get_tabpage(1000) == vim.api.nvim_list_tabpages()[1], 'old external window followed the new tab')");
+    try h.input(":tabprevious<CR>");
+    h.want = h.wins[0];
+    try testing.expect(try h.until(Harness.isCurrent));
+    try testing.expectEqual(@as(i64, 1), h.owners.get(h.wins[0]).?);
 }

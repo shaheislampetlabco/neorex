@@ -11,6 +11,7 @@ const Pane = @This();
 /// Matches a helper's hello. 0 is the startup pane.
 id: u32,
 rex_block: ?RexBlock = null,
+rex_window: ?[43]u8 = null,
 /// Null while a replacement window opens.
 neovim_window_handle: ?NeovimWindowHandle = null,
 /// Owned.

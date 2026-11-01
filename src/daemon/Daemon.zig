@@ -56,6 +56,8 @@ closing: std.AutoArrayHashMapUnmanaged(i64, void) = .empty,
 reopening: std.AutoArrayHashMapUnmanaged(i64, void) = .empty,
 /// New windows without panes yet, and where Neovim put them.
 splits: std.AutoArrayHashMapUnmanaged(i64, windows.Split) = .empty,
+owners: std.AutoArrayHashMapUnmanaged(i64, i64) = .empty,
+active_tab: i64 = 0,
 /// Rex requests waiting for an answer.
 rex_reqs: std.ArrayList(RexReq) = .empty,
 /// False once Rex hangs up: windows keep working, but no new panes or focus.
@@ -73,8 +75,6 @@ focus_rev: i64 = 0,
 ui_focused: bool = true,
 /// Neovim's current window when it's a float, else 0.
 current_float: i64 = 0,
-/// The Rex window our panes are in, from the session view.
-rex_window: ?[43]u8 = null,
 /// The editor size last asked for.
 editor_size: [2]u32 = .{ 0, 0 },
 end: ?End = null,
@@ -123,6 +123,7 @@ pub fn deinit(self: *Daemon) void {
     self.closing.deinit(self.gpa);
     self.reopening.deinit(self.gpa);
     self.splits.deinit(self.gpa);
+    self.owners.deinit(self.gpa);
     self.rex_reqs.deinit(self.gpa);
     if (self.rex_focused) |b| self.gpa.free(b);
     self.* = undefined;
@@ -294,7 +295,16 @@ fn onNvim(self: *Daemon) !bool {
                     try self.reconcile();
                     try self.draw();
                 }
+            } else if (std.mem.eql(u8, n.method, "neorex_layout")) {
+                self.active_tab = try windows.parseLayout(&params, self.gpa, &self.owners);
+                self.pruneSplits();
+                try self.reconcile();
             } else if (try windows.parseNote(n.method, &params)) |note| switch (note) {
+                .focus => |direction| try self.rexRequest(.other, 0, "session.focus_direction", .{
+                    .session_id = self.session_id,
+                    .direction = @tagName(direction),
+                    .wrap = false,
+                }),
                 .current => |win| try self.onCurrent(win),
                 .float => |win| try self.onCurrentFloat(win),
                 .reopen => |win| if (self.paneByWin(win) != null) try self.reopening.put(self.gpa, win, {}),
@@ -420,7 +430,7 @@ fn reconcile(self: *Daemon) !void {
         i -= 1;
         const p = &self.panes.items[i];
         const win = p.neovim_window_handle orelse continue;
-        if (self.grids.gridOf(win) != null) continue;
+        if (self.owners.contains(win) or self.grids.gridOf(win) != null) continue;
         if (self.reopening.swapRemove(win)) {
             p.neovim_window_handle = null;
             continue;
@@ -440,14 +450,10 @@ fn reconcile(self: *Daemon) !void {
             if (self.grids.gridOf(set.keys()[j]) == null) set.swapRemoveAt(j);
         }
     }
-    var j = self.splits.count();
-    while (j > 0) {
-        j -= 1;
-        if (self.grids.gridOf(self.splits.keys()[j]) == null) self.splits.swapRemoveAt(j);
-    }
 
     for (self.grids.wins.values()) |w| switch (w.kind) {
         .ordinary => {
+            if (self.owners.get(w.win)) |tab| if (tab != self.active_tab) continue;
             if (self.asked.contains(w.win)) continue;
             try self.asked.put(self.gpa, w.win, {});
             const size = if (self.paneByWin(w.win)) |p| windowSize(p) else self.newWindowSize(w.win);
@@ -531,7 +537,8 @@ fn newLayer(self: *Daemon, g: FloatGroups.Group) !void {
         .label = "neorex",
         .options = .{ .shell = "none", .command = &[_][]const u8{ self.exe, "pane", self.sock, id } },
     } };
-    if (self.rex_window) |*w| {
+    const rex_window = if (self.focusedPane()) |p| p.rex_window else null;
+    if (rex_window) |*w| {
         try self.rexRequest(.layer, pane_id, "session.new_layer", .{ .session_id = self.session_id, .window_id = @as([]const u8, w), .bounds = bounds, .layout = layout });
     } else {
         try self.rexRequest(.layer, pane_id, "session.new_layer", .{ .session_id = self.session_id, .bounds = bounds, .layout = layout });
@@ -592,6 +599,27 @@ fn newPaneSize(self: *const Daemon, win: i64) [2]u32 {
 /// Where Neovim put `win`; beside the current window if it didn't say.
 fn splitOf(self: *const Daemon, win: i64) windows.Split {
     return self.splits.get(win) orelse .{ .win = win, .side_by_side = true, .before = false, .from = 0 };
+}
+
+fn pruneSplits(self: *Daemon) void {
+    var j = self.splits.count();
+    while (j > 0) {
+        j -= 1;
+        if (!self.owners.contains(self.splits.keys()[j])) self.splits.swapRemoveAt(j);
+    }
+}
+
+test "split placement survives a layout snapshot before its grid arrives" {
+    var d: Daemon = .{ .gpa = std.testing.allocator, .io = std.testing.io, .loop = undefined, .nvim = undefined, .rex = undefined, .session_id = "", .exe = "", .sock = "" };
+    defer d.splits.deinit(d.gpa);
+    defer d.owners.deinit(d.gpa);
+    try d.splits.put(d.gpa, 1001, .{ .win = 1001, .side_by_side = false, .before = false, .from = 1000 });
+    try d.owners.put(d.gpa, 1001, 1);
+    d.pruneSplits();
+    try std.testing.expect(!d.splitOf(1001).side_by_side);
+    d.owners.clearRetainingCapacity();
+    d.pruneSplits();
+    try std.testing.expectEqual(@as(usize, 0), d.splits.count());
 }
 
 /// The pane a new window splits: its origin's, else the focused one.
@@ -671,12 +699,20 @@ fn setTargets(f: *Forwarder, rects: []const PaneView.Rect) void {
 
 fn newPane(self: *Daemon, win: i64) !void {
     const sp = self.splitOf(win);
+    const tab = self.owners.get(win) orelse return;
     // beside the window it came from, else any pane Rex knows
     // a copy: appending below can move every pane
-    const anchor: Pane.RexBlock = blk: {
-        if (self.splitFrom(sp)) |f| if (f.rex_block) |b| break :blk b;
-        for (self.panes.items) |q| if (q.layer == null) if (q.rex_block) |b| break :blk b;
-        return; // no anchor yet: next flush
+    const anchor: ?Pane.RexBlock = blk: {
+        if (self.splitFrom(sp)) |f| if (f.neovim_window_handle) |w| {
+            if (self.owners.get(w) == tab) if (f.rex_block) |b| break :blk b;
+        };
+        for (self.panes.items) |q| if (q.neovim_window_handle) |w| {
+            if (self.owners.get(w) == tab) {
+                if (q.rex_block) |b| break :blk b;
+                return; // the tab's first Rex pane is still being created
+            }
+        };
+        break :blk null;
     };
     // starts at the guess, not Rex's default
     const size = self.newPaneSize(win);
@@ -689,20 +725,25 @@ fn newPane(self: *Daemon, win: i64) !void {
 
     var id_buf: [16]u8 = undefined;
     const id = try std.fmt.bufPrint(&id_buf, "{d}", .{pane_id});
-    try self.rexRequest(.split, pane_id, "session.new_split", .{
+    const layout = .{ .block = .{
+        .flavor = "com.superlogical.terminal.shell",
+        .label = "neorex",
+        .options = .{
+            .shell = "none",
+            .command = &[_][]const u8{ self.exe, "pane", self.sock, id },
+            .size = .{ .columns = size[0], .rows = size[1] },
+        },
+    } };
+    if (anchor) |*block| try self.rexRequest(.split, pane_id, "session.new_split", .{
         .session_id = self.session_id,
-        .anchor_id = @as([]const u8, &anchor),
+        .anchor_id = @as([]const u8, block),
         .direction = if (sp.side_by_side) "horizontal" else "vertical",
         .side = if (sp.before) "before" else "after",
-        .layout = .{ .block = .{
-            .flavor = "com.superlogical.terminal.shell",
-            .label = "neorex",
-            .options = .{
-                .shell = "none",
-                .command = &[_][]const u8{ self.exe, "pane", self.sock, id },
-                .size = .{ .columns = size[0], .rows = size[1] },
-            },
-        } },
+        .layout = layout,
+    }) else try self.rexRequest(.split, pane_id, "session.new_window", .{
+        .session_id = self.session_id,
+        .window_label = "Neovim",
+        .layout = layout,
     });
 }
 
@@ -872,6 +913,7 @@ fn onRexResponse(self: *Daemon, r: Client.Response) !void {
         return;
     }
     if (p.neovim_window_handle == self.current) try self.focusInRex(p);
+    try self.reconcile();
 }
 
 /// A float in group `g` that takes focus: the input of a picker, which
@@ -890,19 +932,17 @@ fn focusableIn(self: *const Daemon, g: *const FloatGroups.Group) ?i64 {
 /// Remembers which Rex window holds our panes, and where each sits in it.
 fn readLayout(self: *Daemon, wins: []const Value) void {
     for (wins) |w| {
+        const id = Client.str(Client.get(w, "window_id")) orelse continue;
+        if (id.len != 43) continue;
         const layers = Client.get(w, "layers") orelse continue;
         if (layers != .array) continue;
-        var found = false;
         for (layers.array.items) |layer| {
             if (!std.mem.eql(u8, Client.str(Client.get(layer, "kind")) orelse "", "tiled")) {
                 self.readLayerBounds(layer);
                 continue;
             }
-            if (Client.get(layer, "layout")) |l| found = self.readRects(l) or found;
+            if (Client.get(layer, "layout")) |l| self.readRects(l, id[0..43].*);
         }
-        if (!found) continue;
-        const id = Client.str(Client.get(w, "window_id")) orelse continue;
-        if (id.len == 43) self.rex_window = id[0..43].*;
     }
 }
 
@@ -920,23 +960,21 @@ fn readLayerBounds(self: *Daemon, layer: Value) void {
 }
 
 /// Finds our panes' blocks under layout node `node` and keeps their rects.
-fn readRects(self: *Daemon, node: Value) bool {
-    var found = false;
+fn readRects(self: *Daemon, node: Value, window: [43]u8) void {
     switch (node) {
         .object => |o| {
             if (Client.str(o.get("block_id"))) |b| if (self.paneByBlock(b)) |p| if (rect4(o.get("rect"))) |r| {
                 p.rect = r;
-                found = true;
+                p.rex_window = window;
             };
             var it = o.iterator();
-            while (it.next()) |e| found = self.readRects(e.value_ptr.*) or found;
+            while (it.next()) |e| self.readRects(e.value_ptr.*, window);
         },
         .array => |a| for (a.items) |x| {
-            found = self.readRects(x) or found;
+            self.readRects(x, window);
         },
         else => {},
     }
-    return found;
 }
 
 /// `[x, y, w, h]` as fractions.

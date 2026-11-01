@@ -8,9 +8,21 @@ _G.neorex = M
 
 -- tab page -> anchor window
 local anchors = {}
+local tab_current = {}
 -- the window last reported as current
 local last
 local group = api.nvim_create_augroup('neorex', {})
+
+-- Plugins such as ToggleTerm need to distinguish editor panes from actual floats.
+local win_gettype = vim.fn.win_gettype
+vim.fn.win_gettype = function(win)
+  local kind = win_gettype(win)
+  local id = win or 0
+  if id == 0 then id = api.nvim_get_current_win()
+  elseif id < 1000 then id = vim.fn.win_getid(id) end
+  if kind == 'popup' and api.nvim_win_is_valid(id) and api.nvim_win_get_config(id).external then return '' end
+  return kind
+end
 
 local function is_anchor(win)
   for _, a in pairs(anchors) do
@@ -66,7 +78,7 @@ end
 
 --- Sizes external `win` to fill `w` x `h`, statusline included.
 function M.size(win, w, h)
-  if not shown(win) then return end
+  if not shown(win) or not api.nvim_win_get_config(win).external then return end
   sizes[win] = { w, h }
   give_statusline(win)
   local th = text_height(win, h)
@@ -85,6 +97,7 @@ end
 function M.adopt(win, w, h)
   if not shown(win) or api.nvim_win_get_config(win).external then return end
   local tab = api.nvim_win_get_tabpage(win)
+  if tab ~= api.nvim_get_current_tabpage() then return end
   if not anchor_of(tab) then
     local buf = api.nvim_create_buf(false, true)
     vim.bo[buf].bufhidden = 'wipe'
@@ -171,6 +184,11 @@ api.nvim_create_autocmd('WinNew', {
 local pending = false
 local function report()
   pending = false
+  local owners = {}
+  for _, win in ipairs(api.nvim_list_wins()) do
+    if shown(win) then owners[#owners + 1] = { win, api.nvim_win_get_tabpage(win) } end
+  end
+  vim.rpcnotify(chan, 'neorex_layout', api.nvim_get_current_tabpage(), owners)
   local cur = api.nvim_get_current_win()
   if is_anchor(cur) then
     -- never shown: move on the way <C-w>w or <C-w>W was going
@@ -202,7 +220,49 @@ local function schedule_report()
   pending = true
   vim.schedule(report)
 end
-api.nvim_create_autocmd('WinEnter', { group = group, callback = schedule_report })
+
+-- External windows have no native directional neighbours; Rex owns their layout.
+for _, key in ipairs({ { 'h', 'Left', 'left' }, { 'j', 'Down', 'down' }, { 'k', 'Up', 'up' }, { 'l', 'Right', 'right' } }) do
+  local letter, arrow, direction = unpack(key)
+  vim.keymap.set({ 'n', 't' }, '<C-' .. letter .. '>', function()
+    vim.rpcnotify(chan, 'neorex_focus', direction)
+  end)
+  vim.keymap.set({ 'n', 'i', 'c', 't' }, '<C-' .. arrow .. '>', function()
+    local region = package.loaded['config.diffview_region']
+    if vim.fn.mode() ~= 'n' or api.nvim_win_get_config(0).relative ~= ''
+      or ((letter == 'j' or letter == 'k') and region and region.keeps_arrows and region.keeps_arrows(letter)) then
+      return '<' .. arrow .. '>'
+    end
+    vim.rpcnotify(chan, 'neorex_focus', direction)
+    return ''
+  end, { expr = true })
+end
+api.nvim_create_autocmd({ 'WinEnter', 'WinClosed', 'TabClosed' }, { group = group, callback = schedule_report })
+
+-- Neovim leaves tp_curwin stale when departing an external window.
+api.nvim_create_autocmd('TabLeave', {
+  group = group,
+  callback = function()
+    local tab = api.nvim_get_current_tabpage()
+    local anchor = anchor_of(tab)
+    if not anchor then return end
+    tab_current[tab] = api.nvim_get_current_win()
+    for _, win in ipairs(api.nvim_tabpage_list_wins(tab)) do
+      if api.nvim_win_get_config(win).external then
+        api.nvim_win_set_config(win, { external = false, split = 'right', win = anchor })
+      end
+    end
+    api.nvim_set_current_win(anchor)
+  end,
+})
+api.nvim_create_autocmd('TabEnter', {
+  group = group,
+  callback = function()
+    local win = tab_current[api.nvim_get_current_tabpage()]
+    if win and shown(win) then api.nvim_set_current_win(win) end
+    schedule_report()
+  end,
+})
 
 -- a statusline came, went or changed: fit the windows to their panes again
 api.nvim_create_autocmd('OptionSet', {
